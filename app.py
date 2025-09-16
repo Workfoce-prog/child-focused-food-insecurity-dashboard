@@ -5,6 +5,13 @@ import pandas as pd
 import numpy as np
 import streamlit as st
 import pydeck as pdk
+# --- bootstrap paths & clear stale caches once ---
+try: st.cache_data.clear()
+except Exception: pass
+
+BASE = Path(__file__).resolve().parent
+DATA = BASE / "data"
+DATA.mkdir(parents=True, exist_ok=True)
 
 # ---------- Page ----------
 st.set_page_config(page_title="Kids Food Insecurity Ops Dashboard (MN)", layout="wide")
@@ -53,20 +60,27 @@ st.subheader("1) Load Base Data (Children)")
 
 @st.cache_data(show_spinner=False)
 def load_base_df() -> pd.DataFrame:
-    base = Path(__file__).resolve().parent / "data" / "sample_child_dashboard.csv"
-    return pd.read_csv(base)
+    target = DATA / "sample_child_dashboard.csv"
+    if target.exists():
+        return pd.read_csv(target)
 
-if mmg_upload is not None:
-    mmg_df = pd.read_csv(mmg_upload)
-else:
-    mmg_df = None
+    # --- seed a minimal MN child sample if missing ---
+    cols = [
+        "county","fips","lat","lon","population","child_population",
+        "child_household_risk","child_access_score","child_experience_score",
+        "child_resilience_score","child_policy_buffer",
+        "mmg_child_rate","mmg_child_count","mmg_meal_cost","li_la_share"
+    ]
+    rows = [
+        ("Hennepin","27053",45.003,-93.265,1284565,325000, 67,57,62,52,47, 11.8,38350,3.60, 0.21),
+        ("Ramsey","27123",44.953,-93.090, 552352,120000, 72,54,64,49,47, 12.6,15120,3.50, 0.24),
+        ("Dakota","27037",44.731,-93.089, 444567,115000, 52,60,47,57,52,  8.9,10235,3.45, 0.14),
+    ]
+    df_seed = pd.DataFrame(rows, columns=cols)
+    df_seed.to_csv(target, index=False)
+    st.info(f"Created sample dataset at {target.relative_to(BASE)}")
+    return df_seed.copy()
 
-if lila_upload is not None:
-    lila_df = pd.read_csv(lila_upload)
-else:
-    lila_df = None
-
-df = load_base_df()
 
 # ---------- 2) Join Overlays (optional) ----------
 st.subheader("2) Overlays")
