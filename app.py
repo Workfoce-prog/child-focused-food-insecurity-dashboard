@@ -241,4 +241,146 @@ if {"mmg_child_count","mmg_child_rate"}.issubset(df.columns):
     st.write(f"Estimated statewide reduction in children experiencing food insecurity (illustrative): **{delta:,}**")
 else:
     st.caption("Add MMG Children overlay to view an estimated statewide change in child FI counts.")
+# ---------- 7) Action Recommendations ----------
+st.subheader("7) Action Recommendations (auto-generated)")
+
+# Controls
+scope = st.radio("Target scope", ["All counties", "Only Red/Critical"], horizontal=True, index=1)
+top_n = st.slider("Top N actions per county", 1, 10, 5)
+
+# Optional category filter (you can uncheck to hide a bucket)
+categories_all = [
+    "School Nutrition", "SNAP / WIC", "Access & Logistics",
+    "CBO / Food Shelves", "Screening & Referrals", "Cost & Procurement"
+]
+categories_on = st.multiselect("Include categories", categories_all, default=categories_all)
+
+# Helper to safely fetch optional fields
+def _get(r, col, default=np.nan):
+    try:
+        return r[col]
+    except KeyError:
+        return default
+
+def recommend_actions_for_row(r):
+    """
+    Returns list of (category, action, priority_score, reason) for a single county row.
+    Priority is a simple severity/scale blend:
+      base + RAG bump + CFIRI scaling + (optional) MMG rate bump + access bump
+    """
+    recs = []
+
+    def add(cat, action, reason, base=1.0):
+        if cat not in categories_on:
+            return
+        score = base
+        # severity bump
+        rag = r["RAG_CHILD"]
+        if rag == "Critical": score += 2.5
+        elif rag == "Red":    score += 1.5
+        # overall risk scaling
+        score += float(r["CFIRI_CHILD"]) / 100.0  # +0..+1
+        # scale-of-need bump (if MMG rate present)
+        mmg_rate = _get(r, "mmg_child_rate", np.nan)
+        if pd.notna(mmg_rate): score += float(mmg_rate) / 50.0  # up to +2
+        # access penalty awareness
+        if float(r["child_access_score"]) > 60: score += 0.5
+        recs.append((cat, action, round(score, 2), reason))
+
+    # --- RULES ---
+
+    # 1) School Nutrition — use when policy buffer shortfall is high or county is severe
+    if (float(r["child_policy_buffer"]) >= 55) or (r["RAG_CHILD"] in ("Red","Critical")):
+        add("School Nutrition",
+            "Accelerate CEP/Universal Meals + Breakfast After the Bell",
+            "High policy buffer shortfall and/or severe RAG; school meals coverage can reduce child FI quickly.", base=2.2)
+
+    # 2) SNAP / WIC — when household risk or MMG rate is high
+    if (float(r["child_household_risk"]) >= 60) or (pd.notna(_get(r,"mmg_child_rate")) and float(_get(r,"mmg_child_rate")) >= 12):
+        add("SNAP / WIC",
+            "Targeted SNAP outreach + WIC enrollment & recert simplifications",
+            "Elevated household risk and/or child FI rate; increase take-up and retention.", base=2.0)
+
+    # 3) Access & Logistics — when access score or LI/LA share is high
+    li_la = _get(r, "li_la_share", np.nan)   # 0–1 proportion if present
+    if (float(r["child_access_score"]) >= 60) or (pd.notna(li_la) and float(li_la) >= 0.25):
+        add("Access & Logistics",
+            "Add summer/after-school meal sites + mobile markets; adjust transit/last-mile",
+            "Access deficits (distance/rurality/LI-LA) suggest siting/logistics fixes.", base=1.8)
+
+    # 4) CBO / Food Shelves — when resilience shortfall is high
+    if float(r["child_resilience_score"]) >= 55:
+        add("CBO / Food Shelves",
+            "Capacity grants (cold storage, staffing) + cross-county logistics & volunteer drivers",
+            "Resilience shortfall indicates network capacity gaps.", base=1.6)
+
+    # 5) Screening & Referrals — when experiential signal is high
+    if float(r["child_experience_score"]) >= 60:
+        add("Screening & Referrals",
+            "School-based screening (Hunger Vital Sign) + backpack/weekend meals + 211/benefits navigators",
+            "High experiential indicators call for direct, school-centered interventions.", base=1.5)
+
+    # 6) Cost & Procurement — when local meal cost is high
+    mmg_cost = _get(r, "mmg_meal_cost", np.nan)
+    if pd.notna(mmg_cost) and float(mmg_cost) >= 3.60:
+        add("Cost & Procurement",
+            "Boost per-meal reimbursement; cooperative bulk purchasing & food-hub partnerships",
+            "Elevated local meal costs; pooling & co-ops can stretch dollars.", base=1.2)
+
+    # 7) Scale-up prompt — big kid population + severe RAG
+    if (int(r["child_population"]) >= 30000) and (r["RAG_CHILD"] in ("Red","Critical")):
+        add("CBO / Food Shelves",
+            "Stand up a county coordination cell to scale hubs & cross-program referrals",
+            "Large child population with severe risk warrants centrally coordinated scale-up.", base=1.4)
+
+    return recs
+
+# Choose target set
+target_df = df.copy()
+if scope == "Only Red/Critical":
+    target_df = target_df[target_df["RAG_CHILD"].isin(["Red","Critical"])].copy()
+
+# Build plan table (one row per county-action)
+plan_rows = []
+for _, row in target_df.iterrows():
+    recs = sorted(recommend_actions_for_row(row), key=lambda x: -x[2])[:top_n]
+    for cat, action, score, reason in recs:
+        plan_rows.append({
+            "county": row["county"],
+            "RAG": row["RAG_CHILD"],
+            "CFIRI_CHILD": round(float(row["CFIRI_CHILD"]), 1),
+            "child_population": int(row["child_population"]),
+            "category": cat,
+            "action": action,
+            "priority": score,
+            "reason": reason,
+        })
+
+if len(plan_rows) == 0:
+    st.info("No recommendations under the current filters.")
+else:
+    plan = pd.DataFrame(plan_rows).sort_values(["priority","CFIRI_CHILD","child_population"], ascending=[False, False, False])
+    st.markdown("**Prioritized county-action plan**")
+    st.dataframe(plan, use_container_width=True, hide_index=True)
+
+    # Summary by action across state
+    st.markdown("**Roll-up by action (across targeted counties)**")
+    summary = (plan
+               .groupby(["category","action"], as_index=False)
+               .agg(counties=("county","nunique"),
+                    avg_priority=("priority","mean"),
+                    total_children=("child_population","sum"))
+               .sort_values(["avg_priority","total_children"], ascending=[False, False]))
+    summary["avg_priority"] = summary["avg_priority"].round(2)
+    st.dataframe(summary, use_container_width=True, hide_index=True)
+
+    # Downloads
+    st.download_button("Download county-action plan (CSV)", plan.to_csv(index=False).encode(), "child_action_plan_by_county.csv")
+    st.download_button("Download action roll-up (CSV)", summary.to_csv(index=False).encode(), "child_action_rollup.csv")
+
+    # Small guidance box
+    st.caption(
+        "Priority is a heuristic that blends severity (RAG), overall risk (CFIRI), scale of need (MMG child rate if available), "
+        "and access deficits. Tune weights upstream and narrow scope to focus operations."
+    )
 
